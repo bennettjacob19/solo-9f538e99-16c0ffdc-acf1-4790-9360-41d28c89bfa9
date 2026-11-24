@@ -1,9 +1,12 @@
 """Writer-side Flask process: operator console for the single-gateway drill.
 
 Endpoints (HTML + JSON API):
-  GET  /                 dashboard (clock, pools, free ranges, leases, logs)
+  GET  /                 dashboard (clock, pools, free ranges, leases,
+                         route-table usage/limit, logs)
   POST /api/pool         bring the new pool online (invalid input = no write)
   POST /api/lease        issue 60-minute lease(s) from the active pool
+  POST /api/route-limit  set/clear the gateway route-entry limit
+  GET  /api/routes       committed route-table usage + entry preview
   POST /api/advance      prepare an advance (clock pauses, drill continues)
   POST /api/advance/commit   settle the batch and publish one new state
   POST /api/advance/abort    reject the prepared advance, state preserved
@@ -13,7 +16,8 @@ from flask import Flask, jsonify, redirect, render_template, request, url_for
 from .db import connect, init_db, recover_pending
 from .logic import (DrillError, ListChanged, abort_advance, allocate,
                     change_pool, commit_advance, free_summary, get_state,
-                    prepare_advance, recent_logs)
+                    list_routes, prepare_advance, recent_logs, route_status,
+                    set_route_limit)
 
 
 def create_app(db_path=None):
@@ -49,7 +53,8 @@ def create_app(db_path=None):
             logs = recent_logs(conn)
             return render_template(
                 "dashboard.html", meta=meta, pools=pool_views, leases=leases,
-                logs=logs, pending=pending)
+                logs=logs, pending=pending, rstate=state["route_state"],
+                routes=list_routes(conn, 30))
         finally:
             conn.close()
 
@@ -86,6 +91,39 @@ def create_app(db_path=None):
                 "已从 %s 发放 %d 个 60 分钟租约" % (cidr, len(issued)))
         except DrillError as exc:
             return _respond({"ok": False, "error": str(exc)}, str(exc), ok=False)
+        finally:
+            conn.close()
+
+    @app.post("/api/route-limit")
+    def api_route_limit():
+        src = request.form if request.form else (request.json or {})
+        raw = src.get("limit", "")
+        conn = db()
+        try:
+            limit, usage = set_route_limit(conn, raw)
+            msg = ("路由条目上限已设为 %d 条（当前用量 %d 条）" % (limit, usage)
+                   if limit is not None
+                   else "路由条目上限已清除（当前用量 %d 条）" % usage)
+            return _respond({"ok": True, "max_entries": limit,
+                             "usage": usage}, msg)
+        except DrillError as exc:
+            return _respond({"ok": False, "error": str(exc)}, str(exc),
+                            ok=False)
+        finally:
+            conn.close()
+
+    @app.get("/api/routes")
+    def api_routes():
+        conn = db()
+        try:
+            st = route_status(conn)
+            rows = list_routes(conn, 50)
+            return jsonify({
+                "ok": True,
+                "usage": st["entry_count"],
+                "max_entries": st["max_entries"],
+                "routes": [r["prefix"] for r in rows],
+                "preview_count": len(rows)})
         finally:
             conn.close()
 

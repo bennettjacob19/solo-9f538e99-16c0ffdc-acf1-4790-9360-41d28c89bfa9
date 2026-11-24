@@ -57,7 +57,7 @@
       </label></p>
       <button type="submit">换池（无效配置保留原状）</button>
     </form>
-    <p class="muted">单次演练只允许换一次；换池不展开候选前缀，空闲空间以区间 [start,end) 持久化。</p>
+    <p class="muted">单次演练只允许换一次；新池须与旧池不相交；换池不展开候选前缀，空闲空间以区间 [start,end) 持久化。</p>
   </div>
 
   <div class="card">
@@ -73,6 +73,34 @@
          <button type="submit">暂停并核算本次到期</button></p>
     </form>
   </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">④ 网关转发表（新池在租地址的最少 CIDR 覆盖，不含空闲地址）</h2>
+  <p>用量：<strong>{{ rstate.entry_count }}</strong> 条 ／ 上限：
+    {% if rstate.max_entries is none %}<span class="tag">未设限</span>
+    {% else %}<strong>{{ rstate.max_entries }}</strong> 条{% endif %}
+    {% if rstate.max_entries is not none and rstate.entry_count >= rstate.max_entries %}
+      <span class="tag old">已满</span>{% endif %}</p>
+  <form method="post" action="/api/route-limit">
+    <p><label>路由条目上限：<input name="limit" inputmode="numeric" size="8"
+          placeholder="留空 = 不限"></label>
+       <button type="submit">设置限额</button>
+       <span class="muted">低于当前用量的限额不生效；领址与时钟提交按整批变更后的条目数核算，超限整单回滚并提示所需条目数。</span></p>
+  </form>
+  {% if routes %}
+  <table>
+  <tr><th>#</th><th>已提交路由前缀</th><th>起始槽位</th><th>覆盖槽数</th></tr>
+  {% for r in routes %}
+  <tr><td>{{ loop.index }}</td><td><code>{{ r.prefix }}</code></td>
+      <td>{{ r.start_slot }}</td><td>{{ 2 ** (r.deleg_len - r.prefix_len) }}</td></tr>
+  {% endfor %}
+  </table>
+  {% if rstate.entry_count > routes|length %}
+    <p class="muted">仅显示前 {{ routes|length }} 条，共 {{ rstate.entry_count }} 条。</p>
+  {% endif %}
+  {% endif %}
+  <p class="muted">网关探测页（只读）：<code>http://localhost:8001/</code> —— 输入目的 IPv6 地址，按已提交路由显示命中前缀或丢弃。</p>
 </div>
 
 <h2>地址池与可领范围（持久化空闲区间，重启不回扫租约）</h2>

@@ -1,12 +1,19 @@
 """End-to-end self tests for the IPv6 pool-swap drill (stdlib only).
 
 Run:  python3 selftest.py
-Covers: seed data, invalid config rollback, pool swap, overlap/coverage,
-first-fit leasing and pool-full, clock expiry including leases taken during
-the pause, list-changed redo, fault-injected commit interruption, read-only
-gateway, restart recovery without lease scans, and O(1)-ish allocation cost.
+Covers: seed data, invalid config rollback, disjoint pool swap, /56 and /60
+boundaries, first-fit leasing and pool-full, clock expiry including leases
+taken during the pause, list-changed redo, fault-injected commit
+interruption, read-only gateway, restart recovery without lease scans,
+O(1)-ish allocation cost — plus the gateway route table: entry limit and
+usage, batch buddy-merge and expiry split against the minimal CIDR cover,
+limit-overflow rollback for both leasing and clock commit, committed-only
+probes with table-size-independent read counts, restart persistence and
+old-volume migration.
 """
+import ipaddress
 import os
+import random
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +53,56 @@ def jpost(client, url, payload=None, raw=False):
     else:
         resp = client.post(url, json=payload or {})
     return resp.status_code, resp.get_json()
+
+
+def db_routes(path):
+    """Committed route prefixes of the new pool, plus the counter state."""
+    conn = connect(path)
+    rows = conn.execute(
+        "SELECT r.prefix FROM routes r JOIN pools p ON p.id = r.pool_id"
+        " ORDER BY r.start_slot").fetchall()
+    st = conn.execute("SELECT * FROM route_state WHERE id = 1").fetchone()
+    raw_count = conn.execute("SELECT COUNT(*) AS c FROM routes").fetchone()["c"]
+    conn.close()
+    return sorted(r["prefix"] for r in rows), st, raw_count
+
+
+def reference_cover(cidr, deleg_len, slots):
+    """Minimal CIDR cover of the given leased slots, computed from scratch
+    with ipaddress.summarize_address_range (the oracle for route tests)."""
+    net = ipaddress.IPv6Network(cidr)
+    base = int(net.network_address)
+    unit = 1 << (128 - deleg_len)
+    slots = sorted(slots)
+    out, i = [], 0
+    while i < len(slots):
+        j = i
+        while j + 1 < len(slots) and slots[j + 1] == slots[j] + 1:
+            j += 1
+        out += [str(p) for p in ipaddress.summarize_address_range(
+            ipaddress.IPv6Address(base + slots[i] * unit),
+            ipaddress.IPv6Address(base + (slots[j] + 1) * unit - 1))]
+        i = j + 1
+    return sorted(out)
+
+
+def active_slots(path, pool_id=2):
+    conn = connect(path)
+    rows = conn.execute(
+        "SELECT slot FROM leases WHERE pool_id = ? AND status = 'active'",
+        (pool_id,)).fetchall()
+    conn.close()
+    return [r["slot"] for r in rows]
+
+
+def check_routes_consistent(path, cidr, deleg_len, label):
+    """Routes must equal the minimal cover of active leases, and the
+    running counter must equal the real row count."""
+    routes, st, raw_count = db_routes(path)
+    expect = reference_cover(cidr, deleg_len, active_slots(path))
+    check("%s：路由=最简覆盖且计数器一致（%d 条）" % (label, len(expect)),
+          routes == expect and st["entry_count"] == len(expect)
+          and raw_count == len(expect))
 
 
 # --------------------------------------------------------------------------
@@ -108,26 +165,36 @@ def test_invalid_config_keeps_state():
     check("全部拒绝后时钟与池状态不变", tuple(before) == tuple(after))
 
 
-def test_swap_and_overlap():
-    print("[3] 换池与交叠覆盖核算")
+def test_swap_disjoint_rule():
+    print("[3] 换池须与旧池不相交；交叠配置整单回滚")
     path = fresh_db()
     client = web_app(path).test_client()
     gw = gateway_app(path).test_client()
 
-    # New /60 pool covering exactly old slot 2, whose delegated prefix is
-    # 2001:db8:aaaa:20::/60 (verified via the same integer math as leasing).
+    # A new pool inside the old aggregate must be rejected, state preserved.
     code, body = jpost(client, "/api/pool",
                        {"cidr": "2001:db8:aaaa:20::/60", "deleg_len": 60})
-    check("交叠新池换池成功", code == 200 and body["slots"] == 1
-          and body["cidr"] == "2001:db8:aaaa:20::/60")
+    check("旧池内部的新池被拒（交叠）", code == 400 and "不相交" in body["error"])
+    code, body = jpost(client, "/api/pool",
+                       {"cidr": "2001:db8:aaaa::/47", "deleg_len": 56})
+    check("包含旧池的新池同样被拒", code == 400 and "不相交" in body["error"])
+    conn = connect(path)
+    check("交叠配置回滚后无新池、时钟为 0",
+          tuple(conn.execute(
+              "SELECT new_pool_id, now_seconds FROM meta").fetchone())
+          == (None, 0))
+    conn.close()
+
+    code, body = jpost(client, "/api/pool",
+                       {"cidr": "2001:db8:bbbb::/56", "deleg_len": 56})
+    check("不相交新池上线成功", code == 200 and body["slots"] == 1)
     view = gw.get("/withdrawal").get_json()
-    check("新汇总仅覆盖旧租约 slot2，未覆盖=4", view["uncovered_count"] == 4)
-    check("最早撤路时刻仍为 3600（slot0/1）",
-          view["earliest_withdrawal_seconds"] == 3600)
-    check("未覆盖名单前缀正确",
-          sorted(x["prefix"] for x in view["uncovered_leases"]) == sorted([
-              "2001:db8:aaaa::/60", "2001:db8:aaaa:10::/60",
-              "2001:db8:aaaa:50::/60", "2001:db8:aaaa:60::/60"]))
+    check("不相交新池不覆盖任何旧租约，未覆盖=5", view["uncovered_count"] == 5)
+    check("最早撤路时刻仍为 3600", view["earliest_withdrawal_seconds"] == 3600)
+    routes, st, _ = db_routes(path)
+    check("换池后路由表为空、用量 0、未设限",
+          routes == [] and st["entry_count"] == 0
+          and st["max_entries"] is None)
 
     code, body = jpost(client, "/api/pool",
                        {"cidr": "2001:db8:zzzz::/56", "deleg_len": 56})
@@ -377,13 +444,290 @@ def test_abort_and_non_advance():
     conn.close()
 
 
+NEW_CIDR, NEW_DELEG = "2001:db8:eeee::/48", 60
+
+
+def test_route_limit_and_lease_overflow():
+    print("[10] 路由限额：设置/查看/低于用量不生效/领址超限整单回滚")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    jpost(client, "/api/pool", {"cidr": NEW_CIDR, "deleg_len": NEW_DELEG})
+
+    code, body = jpost(client, "/api/route-limit", {"limit": "abc"})
+    check("非整数限额被拒", code == 400)
+    code, body = jpost(client, "/api/route-limit", {"limit": -2})
+    check("负数限额被拒", code == 400)
+
+    code, _ = jpost(client, "/api/lease", {"count": 2})
+    routes, st, _ = db_routes(path)
+    check("领址 2 个合并为 1 条 /59，用量可见",
+          routes == ["2001:db8:eeee::/59"] and st["entry_count"] == 1)
+
+    code, body = jpost(client, "/api/route-limit", {"limit": 0})
+    check("限额 0 低于当前用量 1，不生效", code == 400 and "未生效" in body["error"])
+    _, st, _ = db_routes(path)
+    check("原限额保持不变（未设限）", st["max_entries"] is None)
+
+    code, body = jpost(client, "/api/route-limit", {"limit": 2})
+    check("限额 2（≥ 用量 1）生效", code == 200 and body["max_entries"] == 2
+          and body["usage"] == 1)
+
+    code, _ = jpost(client, "/api/lease", {"count": 2})
+    routes, st, _ = db_routes(path)
+    check("再领 2 个塌缩为 1 条 /58，未超限",
+          routes == ["2001:db8:eeee::/58"] and st["entry_count"] == 1)
+
+    # A batch of 3 more leases would need 3 entries (/58 + /59 + /60).
+    code, body = jpost(client, "/api/lease", {"count": 3})
+    check("领址超限被拒并提示所需条目数 3 与上限 2",
+          code == 400 and "共需 3 条" in body["error"]
+          and "上限 2 条" in body["error"])
+    conn = connect(path)
+    check("回滚后新池在租仍为 4 条、时钟 0",
+          conn.execute("SELECT COUNT(*) c FROM leases"
+                       " WHERE pool_id = 2 AND status = 'active'"
+                       ).fetchone()["c"] == 4
+          and conn.execute("SELECT now_seconds FROM meta"
+                           ).fetchone()[0] == 0)
+    conn.close()
+    routes, st, _ = db_routes(path)
+    check("回滚后路由保持 1 条 /58",
+          routes == ["2001:db8:eeee::/58"] and st["entry_count"] == 1)
+
+    code, body = jpost(client, "/api/route-limit", {"limit": ""})
+    check("留空清除限额", code == 200 and body["max_entries"] is None)
+    code, _ = jpost(client, "/api/lease", {"count": 3})
+    check("清除后同批领址成功", code == 200)
+    check_routes_consistent(path, NEW_CIDR, NEW_DELEG, "领址 7 个后")
+
+
+def test_route_merge_split_and_commit_overflow():
+    print("[11] 批量合并与到期拆分；提交超限保留原时钟/租约/路由")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    jpost(client, "/api/pool", {"cidr": NEW_CIDR, "deleg_len": NEW_DELEG})
+
+    jpost(client, "/api/lease", {"count": 4})            # slots 0-3, exp 3600
+    routes, _, _ = db_routes(path)
+    check("4 连租合并为 1 条 /58", routes == ["2001:db8:eeee::/58"])
+
+    jpost(client, "/api/advance", {"target_seconds": 1800})
+    jpost(client, "/api/advance/commit")                 # nothing expires
+    jpost(client, "/api/lease", {"count": 4})            # slots 4-7, exp 5400
+    routes, st, _ = db_routes(path)
+    check("整批 8 连租塌缩为 1 条 /57",
+          routes == ["2001:db8:eeee::/57"] and st["entry_count"] == 1)
+
+    jpost(client, "/api/advance", {"target_seconds": 3600})
+    jpost(client, "/api/advance/commit")                 # new slots 0-3 expire
+    routes, _, _ = db_routes(path)
+    check("前半到期后余 4-7 为 1 条 /58",
+          routes == ["2001:db8:eeee:40::/58"])
+
+    jpost(client, "/api/lease", {"count": 2})            # slots 0,1 exp 7200
+    jpost(client, "/api/advance", {"target_seconds": 5400})
+    jpost(client, "/api/advance/commit")                 # slots 4-7 expire
+    routes, _, _ = db_routes(path)
+    check("再到期后余 0-1 为 1 条 /59", routes == ["2001:db8:eeee::/59"])
+
+    jpost(client, "/api/lease", {"count": 4})            # slots 2-5 exp 9000
+    jpost(client, "/api/lease", {"count": 2})            # slots 6,7 exp 9000
+    routes, _, _ = db_routes(path)
+    check("重新并满 0-7 为 1 条 /57", routes == ["2001:db8:eeee::/57"])
+
+    code, _ = jpost(client, "/api/route-limit", {"limit": 1})
+    check("限额 1（= 当前用量）生效", code == 200)
+
+    # Advance to 7200: new slots 0,1 expire, the /57 must split into 2.
+    jpost(client, "/api/advance", {"target_seconds": 7200})
+    code, body = jpost(client, "/api/advance/commit")
+    check("到期拆分需 2 条超过限额 1，提交被拒并提示所需条目数",
+          code == 400 and "共需 2 条" in body["error"])
+    conn = connect(path)
+    check("原时钟保留在 5400",
+          conn.execute("SELECT now_seconds FROM meta").fetchone()[0] == 5400)
+    check("推进保持待提交，可提高限额后重试",
+          conn.execute("SELECT pending_id FROM meta").fetchone()[0] is not None)
+    check("应到期的新池租约全部保留 active",
+          conn.execute("SELECT COUNT(*) c FROM leases"
+                       " WHERE pool_id = 2 AND status = 'active'"
+                       ).fetchone()["c"] == 8)
+    conn.close()
+    routes, st, _ = db_routes(path)
+    check("路由保持 1 条 /57",
+          routes == ["2001:db8:eeee::/57"] and st["entry_count"] == 1)
+
+    code, _ = jpost(client, "/api/route-limit", {"limit": 5})
+    check("提高限额至 5", code == 200)
+    code, _ = jpost(client, "/api/advance/commit")
+    check("重试提交成功", code == 200)
+    routes, st, _ = db_routes(path)
+    check("到期拆分生效：/57 拆为 /59 + /58 共 2 条",
+          routes == ["2001:db8:eeee:20::/59", "2001:db8:eeee:40::/58"]
+          and st["entry_count"] == 2)
+    conn = connect(path)
+    check("时钟推进到 7200",
+          conn.execute("SELECT now_seconds FROM meta").fetchone()[0] == 7200)
+    conn.close()
+    check_routes_consistent(path, NEW_CIDR, NEW_DELEG, "拆分提交后")
+
+    # Fault-injected commit: the split must roll back with everything else.
+    jpost(client, "/api/advance", {"target_seconds": 9000})
+    resp = client.post("/api/advance/commit", json={"fault_inject": True})
+    check("故障注入返回 500", resp.status_code == 500)
+    rec = recover_pending(connect(path))
+    check("恢复流程中止悬挂推进", rec is not None)
+    conn = connect(path)
+    check("中断后时钟仍为 7200",
+          conn.execute("SELECT now_seconds FROM meta").fetchone()[0] == 7200)
+    conn.close()
+    routes, st, _ = db_routes(path)
+    check("中断后路由保持拆分后的 2 条（无部分生效）",
+          routes == ["2001:db8:eeee:20::/59", "2001:db8:eeee:40::/58"]
+          and st["entry_count"] == 2)
+    check_routes_consistent(path, NEW_CIDR, NEW_DELEG, "中断恢复后")
+
+
+def test_gateway_probe():
+    print("[12] 网关探测：命中/丢弃/只按已提交路由/读取数不随表项增长")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    gw = gateway_app(path).test_client()
+    jpost(client, "/api/pool", {"cidr": NEW_CIDR, "deleg_len": NEW_DELEG})
+    jpost(client, "/api/lease", {"count": 4})            # slots 0-3 -> /58
+
+    resp = gw.get("/probe?address=2001:db8:eeee::1")
+    body = resp.get_json()
+    check("在租地址命中 /58", resp.status_code == 200
+          and body["action"] == "hit"
+          and body["prefix"] == "2001:db8:eeee::/58")
+    body = gw.get("/probe?address=2001:db8:eeee:50::").get_json()
+    check("池内空闲地址丢弃", body["action"] == "drop" and body["prefix"] is None)
+    miss_lookups = body["route_lookups"]
+    check("旧池地址丢弃",
+          gw.get("/probe?address=2001:db8:aaaa::").get_json()["action"] == "drop")
+    check("非法地址返回 400", gw.get("/probe?address=not-an-ip").status_code == 400)
+
+    # A route written but not committed must be invisible to the gateway.
+    conn = connect(path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO routes(pool_id, prefix, prefix_len, start_slot)"
+        " VALUES (2, '2001:db8:eeee:50::/60', 60, 5)")
+    body = gw.get("/probe?address=2001:db8:eeee:50::1").get_json()
+    check("未提交路由对网关不可见（仍丢弃）", body["action"] == "drop")
+    conn.execute("ROLLBACK")
+    conn.close()
+
+    # Grow the table to 6 entries; a miss probe reads the same number of
+    # route records as with the 1-entry table.
+    jpost(client, "/api/lease", {"count": 500})
+    _, st, _ = db_routes(path)
+    check("表项增长到 6 条", st["entry_count"] == 6)
+    body = gw.get("/probe?address=2001:db8:eeee:3e80::").get_json()  # slot 1000
+    check("丢弃探测读取数不随表项增长（%d == %d）"
+          % (body["route_lookups"], miss_lookups),
+          body["route_lookups"] == miss_lookups)
+    check("读取数不超过池前缀长度范围（≤13）", body["route_lookups"] <= 13)
+    body = gw.get("/probe?address=2001:db8:eeee::1").get_json()
+    check("大表下命中仍正确（/52）", body["action"] == "hit"
+          and body["prefix"] == "2001:db8:eeee::/52")
+
+    resp = gw.get("/")
+    check("网关探测网页可打开",
+          resp.status_code == 200 and "路由探测" in resp.get_data(as_text=True))
+    page = gw.get("/?address=2001:db8:eeee::1").get_data(as_text=True)
+    check("网页显示命中前缀", "命中" in page and "2001:db8:eeee::/52" in page)
+    page = gw.get("/?address=2001:db8:aaaa::").get_data(as_text=True)
+    check("网页显示丢弃", "丢弃" in page)
+
+
+def test_restart_persistence_and_migration():
+    print("[13] 重启保留限额与已生效路由；旧卷一次性迁移重建路由")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    jpost(client, "/api/pool", {"cidr": NEW_CIDR, "deleg_len": NEW_DELEG})
+    jpost(client, "/api/lease", {"count": 6})            # slots 0-5
+    jpost(client, "/api/route-limit", {"limit": 9})
+    before, before_st, _ = db_routes(path)
+    check("初始用量 2 条（/58 + /59）",
+          before == ["2001:db8:eeee:40::/59", "2001:db8:eeee::/58"]
+          and before_st["entry_count"] == 2)
+
+    # Restart: a fresh app instance on the same volume file.
+    web_app(path)
+    routes, st, _ = db_routes(path)
+    check("重启后限额与已生效路由保留",
+          routes == before and st["max_entries"] == 9
+          and st["entry_count"] == before_st["entry_count"])
+    gw = gateway_app(path).test_client()
+    check("重启后网关探测仍命中",
+          gw.get("/probe?address=2001:db8:eeee::1"
+                 ).get_json()["action"] == "hit")
+
+    # Simulate a volume written before route tracking existed.
+    conn = connect(path)
+    conn.execute("DROP TABLE routes")
+    conn.execute("DROP TABLE route_state")
+    conn.close()
+    web_app(path)  # startup migration rebuilds from free intervals
+    routes, st, _ = db_routes(path)
+    expect = reference_cover(NEW_CIDR, NEW_DELEG, active_slots(path))
+    check("旧卷迁移按空闲区间补集重建路由（不回扫租约）",
+          routes == expect == before and st["entry_count"] == 2
+          and st["max_entries"] is None)
+    row = connect(path).execute(
+        "SELECT detail FROM clock_log WHERE event = 'route-migrate'"
+    ).fetchone()
+    check("迁移写入日志", row is not None and "重建" in row["detail"])
+
+
+def test_routes_fuzz_minimal_cover():
+    print("[14] 随机批量领址/推进：路由恒等于最简覆盖，计数器一致")
+    path = fresh_db()
+    client = web_app(path).test_client()
+    cidr, deleg = "2001:db8:ffff::/52", 60               # 256 slots
+    jpost(client, "/api/pool", {"cidr": cidr, "deleg_len": deleg})
+    rng = random.Random(20261124)
+    ok, merges, splits, prev = True, 0, 0, 0
+    for step in range(60):
+        if rng.random() < 0.6:
+            jpost(client, "/api/lease", {"count": rng.randint(1, 6)})
+        else:
+            now = connect(path).execute(
+                "SELECT now_seconds FROM meta").fetchone()[0]
+            code, _ = jpost(client, "/api/advance",
+                            {"target_seconds":
+                             now + rng.choice([600, 1800, 3600, 7200])})
+            if code == 200:
+                jpost(client, "/api/advance/commit")
+        routes, st, raw = db_routes(path)
+        expect = reference_cover(cidr, deleg, active_slots(path))
+        if not (routes == expect and st["entry_count"] == len(expect)
+                and raw == len(expect)):
+            ok = False
+            print("    第 %d 步不一致：routes=%s expect=%s" % (step, routes, expect))
+            break
+        merges += len(expect) < prev
+        splits += len(expect) > prev
+        prev = len(expect)
+    check("60 步随机批量合并/到期拆分后路由恒为最简覆盖", ok)
+    check("过程中合并与拆分都真实发生（合并 %d 次、拆分 %d 次）" % (merges, splits),
+          merges > 0 and splits > 0)
+
+
 if __name__ == "__main__":
     tests = [test_seed_and_gateway, test_invalid_config_keeps_state,
-             test_swap_and_overlap, test_slash56_boundary,
+             test_swap_disjoint_rule, test_slash56_boundary,
              test_lease_and_pool_full,
              test_expiry_with_pause_leases, test_list_changed_redo,
              test_commit_interruption, test_restart_and_no_scan,
-             test_abort_and_non_advance]
+             test_abort_and_non_advance,
+             test_route_limit_and_lease_overflow,
+             test_route_merge_split_and_commit_overflow,
+             test_gateway_probe,
+             test_restart_persistence_and_migration,
+             test_routes_fuzz_minimal_cover]
     for t in tests:
         t()
     print("\n结果：%d 通过, %d 失败" % (PASS, FAIL))

@@ -5,11 +5,20 @@ ranges of delegation slots. Allocation only touches the first free range,
 so its cost depends on the number of *free fragments*, never on the number
 of leases inside a contiguous occupied run. The ranges are persisted, so
 restart never scans leases to rebuild them.
+
+`routes` holds the committed gateway forwarding table: the minimal CIDR
+cover of the new pool's leased slots, maintained incrementally (buddy
+merge / expiry split) by the writer process. `route_state` is a one-row
+table with the operator-set entry limit (NULL = unlimited) and the
+committed entry count, kept as a running counter so leasing and clock
+commits never rescan the whole route table.
 """
+import ipaddress
 import os
 import sqlite3
 
-from .common import DB_PATH, LEASE_SECONDS, slot_prefix
+from .common import (DB_PATH, LEASE_SECONDS, block_prefix, decompose_slots,
+                     slot_prefix)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -73,6 +82,27 @@ CREATE TABLE IF NOT EXISTS withdrawal_publish(
     earliest_seconds INTEGER,
     published_at INTEGER NOT NULL
 );
+
+-- Committed gateway forwarding entries: the minimal CIDR cover of the new
+-- pool's leased slots. Blocks are aligned and mutually disjoint, so one
+-- pool never holds two entries with the same start_slot.
+CREATE TABLE IF NOT EXISTS routes(
+    pool_id INTEGER NOT NULL REFERENCES pools(id),
+    prefix TEXT NOT NULL,
+    prefix_len INTEGER NOT NULL,
+    start_slot INTEGER NOT NULL,
+    PRIMARY KEY (pool_id, prefix)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_routes_slot
+    ON routes(pool_id, start_slot);
+
+-- One-row route-table state: operator limit (NULL = unlimited) and the
+-- committed entry count as a running counter (no COUNT(*) rescans).
+CREATE TABLE IF NOT EXISTS route_state(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    max_entries INTEGER,
+    entry_count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Built-in old pool and its leases (simulated time, seconds since epoch).
@@ -116,11 +146,11 @@ def init_db(db_path=None, force=False):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_route_tables(conn)
         seeded = conn.execute("SELECT 1 FROM pools WHERE is_new = 0").fetchone()
         if seeded:
             return conn
         conn.execute("BEGIN IMMEDIATE")
-        import ipaddress
         net = ipaddress.IPv6Network(OLD_CIDR)
         slot_count = 1 << (OLD_DELEG - net.prefixlen)
         cur = conn.execute(
@@ -175,6 +205,62 @@ def _earliest_old_expiry(conn, old_pool_id):
         "SELECT MIN(expires_at) AS t FROM leases"
         " WHERE pool_id = ? AND status = 'active'", (old_pool_id,)).fetchone()
     return row["t"]
+
+
+def _migrate_route_tables(conn):
+    """One-time upgrade for volumes created before route tracking existed.
+
+    Inserts the route_state row and, if a new pool is already live, derives
+    its committed routes from the persisted free intervals: leased slots
+    are exactly the complement of free space, so the minimal cover is
+    rebuilt without scanning leases and without expanding the pool slot by
+    slot. On a fresh database this only plants the empty route_state row.
+    """
+    if conn.execute("SELECT 1 FROM route_state WHERE id = 1").fetchone():
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM route_state WHERE id = 1").fetchone():
+            conn.execute("COMMIT")
+            return
+        conn.execute(
+            "INSERT INTO route_state(id, max_entries, entry_count)"
+            " VALUES (1, NULL, 0)")
+        new = conn.execute("SELECT * FROM pools WHERE is_new = 1").fetchone()
+        if new is not None:
+            net = ipaddress.IPv6Network(new["cidr"])
+            free_rows = conn.execute(
+                "SELECT start_slot, end_slot FROM free_intervals"
+                " WHERE pool_id = ? ORDER BY start_slot",
+                (new["id"],)).fetchall()
+            blocks = []
+            pos = 0
+            for row in free_rows:
+                blocks.extend(decompose_slots(pos, row["start_slot"]))
+                pos = row["end_slot"]
+            blocks.extend(decompose_slots(pos, new["slot_count"]))
+            for start, span in blocks:
+                plen = new["deleg_len"] - (span.bit_length() - 1)
+                conn.execute(
+                    "INSERT INTO routes(pool_id, prefix, prefix_len,"
+                    " start_slot) VALUES (?, ?, ?, ?)",
+                    (new["id"],
+                     block_prefix(net, new["deleg_len"], start, plen),
+                     plen, start))
+            conn.execute(
+                "UPDATE route_state SET entry_count = ? WHERE id = 1",
+                (len(blocks),))
+            conn.execute(
+                "INSERT INTO clock_log(advance_id, event, from_seconds,"
+                " to_seconds, detail, at_seconds)"
+                " VALUES (NULL, 'route-migrate', NULL, NULL, ?,"
+                " (SELECT now_seconds FROM meta WHERE id = 1))",
+                ("旧卷升级：按持久化空闲区间的补集重建新池 %s 的已生效路由"
+                 " %d 条，未回扫租约" % (new["cidr"], len(blocks)),))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def recover_pending(conn):

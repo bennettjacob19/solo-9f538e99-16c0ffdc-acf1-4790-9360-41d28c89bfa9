@@ -55,6 +55,28 @@ def slot_prefix(network, deleg_len, slot):
     return str(ipaddress.IPv6Network((base + slot * size, deleg_len), strict=False))
 
 
+def block_prefix(network, deleg_len, start_slot, prefix_len):
+    """Prefix text for the aligned block of delegation slots that starts at
+    start_slot and spans 2**(deleg_len - prefix_len) slots. Pure integer
+    arithmetic; no slot range is ever materialized."""
+    base = int(network.network_address)
+    addr = base + (start_slot << (network.max_prefixlen - deleg_len))
+    return str(ipaddress.IPv6Network((addr, prefix_len), strict=False))
+
+
+def decompose_slots(start, end):
+    """Yield (start_slot, span) aligned power-of-two blocks covering the
+    half-open slot range [start, end) with the fewest CIDR entries. This is
+    the binary decomposition of the range; cost is O(log) in its length."""
+    pos = start
+    while pos < end:
+        span = 1
+        while pos % (span * 2) == 0 and pos + span * 2 <= end:
+            span *= 2
+        yield pos, span
+        pos += span
+
+
 def is_covered(lease_prefix_text, new_pool_network):
     """True when the delegated lease prefix is fully inside the new pool."""
     pfx = ipaddress.IPv6Network(lease_prefix_text, strict=False)

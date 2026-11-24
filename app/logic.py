@@ -1,16 +1,26 @@
-"""Business logic: pool swap, leasing, simulated clock and withdrawal data.
+"""Business logic: pool swap, leasing, simulated clock, withdrawal data
+and the gateway route table.
 
 Concurrency model (SQLite WAL, single writer):
   * Reads never block: the gateway process opens the database read-only.
   * Every state-changing request runs in one BEGIN IMMEDIATE transaction.
   * A prepared clock advance is staging data; leasing stays available while
     it is pending. COMMIT either publishes clock + free ranges + withdrawal
-    together, or rolls everything back, so both processes always observe one
-    consistent committed state.
+    + routes together, or rolls everything back, so both processes always
+    observe one consistent committed state.
+
+Route table (`routes`): the minimal CIDR cover of the new pool's leased
+slots. It is maintained incrementally — buddy-merge on allocation, split
+on expiry — so neither leasing nor a clock commit ever rescans unchanged
+leases or the whole route table, and the pool is never expanded slot by
+slot. The committed entry count lives in `route_state` as a running
+counter; the operator limit is checked against the count *after* a whole
+batch (lease request or expiry batch) is applied, and any overflow rolls
+the entire transaction back, preserving clock, leases and routes.
 """
 import ipaddress
 
-from .common import (LEASE_SECONDS, slot_prefix, validate_pool)
+from .common import (LEASE_SECONDS, block_prefix, slot_prefix, validate_pool)
 from .db import connect
 
 
@@ -34,7 +44,8 @@ def get_state(conn):
         pending = conn.execute(
             "SELECT * FROM clock_advance WHERE id = ?",
             (meta["pending_id"],)).fetchone()
-    return {"meta": meta, "pools": pools, "pending": pending}
+    return {"meta": meta, "pools": pools, "pending": pending,
+            "route_state": _route_state(conn)}
 
 
 def active_pool_id(conn, meta=None):
@@ -145,6 +156,192 @@ def _defragment(conn, pool_id):
 
 
 # --------------------------------------------------------------------------
+# Gateway route table: minimal CIDR cover of the new pool's leased slots
+# --------------------------------------------------------------------------
+#
+# Invariants of the committed `routes` table (per pool):
+#   * entries are aligned blocks of delegation slots, mutually disjoint;
+#   * no two entries are mergeable buddies (same span, aligned neighbours),
+#     which makes the cover the unique minimal one;
+#   * the covered slots are exactly the slots with an active lease.
+# Both updates below touch O(log pool_size) entries via indexed point
+# lookups — never a scan of unchanged leases or of the whole table.
+
+def _route_state(conn):
+    return conn.execute(
+        "SELECT * FROM route_state WHERE id = 1").fetchone()
+
+
+def route_status(conn):
+    st = _route_state(conn)
+    return {"max_entries": st["max_entries"],
+            "entry_count": st["entry_count"]}
+
+
+def list_routes(conn, limit=30):
+    return conn.execute(
+        "SELECT r.*, p.deleg_len AS deleg_len FROM routes r"
+        " JOIN pools p ON p.id = r.pool_id"
+        " ORDER BY r.start_slot LIMIT ?", (limit,)).fetchall()
+
+
+def _route_insert(conn, pool, start_slot, prefix_len):
+    net = ipaddress.IPv6Network(pool["cidr"])
+    conn.execute(
+        "INSERT INTO routes(pool_id, prefix, prefix_len, start_slot)"
+        " VALUES (?, ?, ?, ?)",
+        (pool["id"], block_prefix(net, pool["deleg_len"], start_slot,
+                                  prefix_len),
+         prefix_len, start_slot))
+    conn.execute(
+        "UPDATE route_state SET entry_count = entry_count + 1 WHERE id = 1")
+
+
+def _route_delete(conn, rowid):
+    conn.execute("DELETE FROM routes WHERE rowid = ?", (rowid,))
+    conn.execute(
+        "UPDATE route_state SET entry_count = entry_count - 1 WHERE id = 1")
+
+
+def _route_add_slot(conn, pool, slot):
+    """Cover a newly leased slot: insert its singleton block, then merge
+    with the buddy block while one exists. Each merge step is one indexed
+    lookup; entries elsewhere in the table are never read."""
+    start, span, plen = slot, 1, pool["deleg_len"]
+    while True:
+        buddy = conn.execute(
+            "SELECT rowid FROM routes"
+            " WHERE pool_id = ? AND start_slot = ? AND prefix_len = ?",
+            (pool["id"], start ^ span, plen)).fetchone()
+        if buddy is None:
+            break
+        _route_delete(conn, buddy["rowid"])
+        start = min(start, start ^ span)
+        span <<= 1
+        plen -= 1
+    _route_insert(conn, pool, start, plen)
+
+
+def _route_covering(conn, pool, slot):
+    """Find the committed entry covering a slot: at most one indexed probe
+    per prefix length of the pool, independent of the table size."""
+    for plen in range(pool["deleg_len"], pool["prefix_len"] - 1, -1):
+        span = 1 << (pool["deleg_len"] - plen)
+        start = slot - (slot % span)
+        row = conn.execute(
+            "SELECT rowid, start_slot, prefix_len FROM routes"
+            " WHERE pool_id = ? AND start_slot = ? AND prefix_len = ?",
+            (pool["id"], start, plen)).fetchone()
+        if row is not None:
+            return row
+    return None
+
+
+def _route_remove_slot(conn, pool, slot):
+    """Uncover an expired slot: split its covering entry into aligned
+    halves around the slot, keeping the halves that stay leased. Cost is
+    O(log) in the pool size; the rest of the table is untouched."""
+    row = _route_covering(conn, pool, slot)
+    if row is None:
+        return
+    _route_delete(conn, row["rowid"])
+    start = row["start_slot"]
+    plen = row["prefix_len"]
+    span = 1 << (pool["deleg_len"] - plen)
+    while span > 1:
+        span >>= 1
+        plen += 1
+        if slot < start + span:
+            _route_insert(conn, pool, start + span, plen)  # right half stays
+        else:
+            _route_insert(conn, pool, start, plen)         # left half stays
+            start += span
+
+
+def _check_route_limit(conn):
+    """Validate the committed-count counter against the operator limit.
+    Called once per transaction *after* a whole batch (lease request or
+    expiry batch) changed the table; raising here rolls the batch back."""
+    st = _route_state(conn)
+    limit = st["max_entries"]
+    if limit is not None and st["entry_count"] > limit:
+        raise DrillError(
+            "路由转发表超限：本次变更后共需 %d 条，超过上限 %d 条；"
+            "已保留原时钟、租约与路由，请提高限额后重试"
+            % (st["entry_count"], limit))
+
+
+def set_route_limit(conn, raw):
+    """Set or clear the route-entry limit. A limit below the current
+    committed usage is rejected and the previous limit stays in effect."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        usage = _route_state(conn)["entry_count"]
+        text = "" if raw is None else str(raw).strip()
+        if text == "":
+            new_limit = None
+        else:
+            try:
+                new_limit = int(text)
+            except ValueError:
+                raise DrillError("路由条目上限必须是整数（留空表示不限）")
+            if new_limit < 0:
+                raise DrillError("路由条目上限不能为负数")
+            if new_limit < usage:
+                raise DrillError(
+                    "限额 %d 低于当前用量 %d 条，未生效（原限额保持不变）"
+                    % (new_limit, usage))
+        conn.execute(
+            "UPDATE route_state SET max_entries = ? WHERE id = 1",
+            (new_limit,))
+        conn.execute(
+            "INSERT INTO clock_log(advance_id, event, from_seconds,"
+            " to_seconds, detail, at_seconds)"
+            " VALUES (NULL, 'route-limit', ?, ?, ?, ?)",
+            (meta["now_seconds"], meta["now_seconds"],
+             ("路由条目上限已清除（当前用量 %d 条）" % usage)
+             if new_limit is None else
+             ("路由条目上限设为 %d 条（当前用量 %d 条）" % (new_limit, usage)),
+             meta["now_seconds"]))
+        conn.execute("COMMIT")
+        return new_limit, usage
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def probe_route(conn, address_text):
+    """Longest-prefix match of a destination IPv6 address against the
+    committed routes. Returns (hit_prefix_or_None, lookups).
+
+    The lookup walks the pool's prefix-length range (at most deleg_len -
+    prefix_len + 1 indexed point queries), so the number of route records
+    read never grows with the number of entries in the table. Only
+    committed rows are visible to the caller's connection.
+    """
+    try:
+        addr = ipaddress.IPv6Address(str(address_text).strip())
+    except ValueError:
+        raise DrillError("目的 IPv6 地址非法")
+    pool = conn.execute("SELECT * FROM pools WHERE is_new = 1").fetchone()
+    lookups = 0
+    if pool is None:
+        return None, lookups
+    value = int(addr)
+    for plen in range(pool["deleg_len"], pool["prefix_len"] - 1, -1):
+        mask = ((1 << plen) - 1) << (128 - plen)
+        cand = str(ipaddress.IPv6Network((value & mask, plen), strict=False))
+        row = conn.execute(
+            "SELECT prefix FROM routes WHERE pool_id = ? AND prefix = ?",
+            (pool["id"], cand)).fetchone()
+        lookups += 1
+        if row is not None:
+            return row["prefix"], lookups
+    return None, lookups
+
+
+# --------------------------------------------------------------------------
 # Pool swap
 # --------------------------------------------------------------------------
 
@@ -167,6 +364,10 @@ def change_pool(conn, cidr_text, deleg_len):
         dup = conn.execute("SELECT 1 FROM pools WHERE cidr = ?", (cidr,)).fetchone()
         if dup:
             raise DrillError("该 CIDR 已存在，配置无效，已保留原状")
+        old = conn.execute("SELECT * FROM pools WHERE is_new = 0").fetchone()
+        if network.overlaps(ipaddress.IPv6Network(old["cidr"])):
+            raise DrillError(
+                "新池须与旧池 %s 不相交，配置无效，已保留原状" % old["cidr"])
         now = meta["now_seconds"]
         cur = conn.execute(
             "INSERT INTO pools(cidr, prefix_len, deleg_len, slot_count, is_new)"
@@ -226,8 +427,13 @@ def allocate(conn, count=1):
                 "INSERT INTO leases(pool_id, slot, prefix, starts_at,"
                 " expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
                 (pool_id, slot, pfx, now, now + LEASE_SECONDS))
+            if pool["is_new"]:
+                _route_add_slot(conn, pool, slot)
             issued.append({"id": cur.lastrowid, "prefix": pfx, "slot": slot,
                            "starts_at": now, "expires_at": now + LEASE_SECONDS})
+        # The limit is checked against the entry count after the whole
+        # batch; on overflow everything above rolls back.
+        _check_route_limit(conn)
         conn.execute(
             "INSERT INTO clock_log(advance_id, event, from_seconds, to_seconds,"
             " detail, at_seconds) VALUES (NULL, 'lease', ?, ?, ?, ?)",
@@ -329,6 +535,11 @@ def commit_advance(conn, fault_inject=False):
 
         settled = current  # contains any leases newly taken during the pause
         added = sorted(cur_set - snap_set)
+        new_pool = None
+        if meta["new_pool_id"]:
+            new_pool = conn.execute(
+                "SELECT * FROM pools WHERE id = ?",
+                (meta["new_pool_id"],)).fetchone()
         touched_pools = set()
         for lease_id in settled:
             row = conn.execute(
@@ -338,11 +549,17 @@ def commit_advance(conn, fault_inject=False):
                 "UPDATE leases SET status = 'expired' WHERE id = ?",
                 (lease_id,))
             _release_slot(conn, row["pool_id"], row["slot"])
+            if new_pool is not None and row["pool_id"] == new_pool["id"]:
+                _route_remove_slot(conn, new_pool, row["slot"])
             touched_pools.add(row["pool_id"])
         # Slots released in one batch may bridge ranges that were not yet
         # adjacent at each individual release; coalesce once at the end.
         for pool_id in touched_pools:
             _defragment(conn, pool_id)
+        # The limit is checked against the entry count after the whole
+        # expiry batch; on overflow the commit rolls back and the prepared
+        # advance stays pending so it can be retried with a higher limit.
+        _check_route_limit(conn)
 
         conn.execute(
             "UPDATE meta SET now_seconds = ?, pending_id = NULL WHERE id = 1",
@@ -368,6 +585,12 @@ def commit_advance(conn, fault_inject=False):
         conn.execute("COMMIT")
         return {"target": target, "settled": settled, "added": added}
     except DrillError:
+        # Roll back any writes made before the error (e.g. a route-limit
+        # overflow found after the expiry batch was applied). The prepared
+        # advance stays pending so the operator can raise the limit and
+        # retry, or abort explicitly.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     except RuntimeError:
         raise  # fault injection: connection already closed
